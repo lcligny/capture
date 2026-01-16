@@ -59,6 +59,7 @@ type SwarmService struct {
 	ID           string `json:"id"`
 	Name         string `json:"name"`
 	Image        string `json:"image"`
+	Mode         string `json:"mode"` // "replicated", "global"
 	Replicas     uint64 `json:"replicas"`
 	RunningTasks uint64 `json:"running_tasks"`
 }
@@ -235,9 +236,14 @@ func collectSwarmMetrics(ctx context.Context, cli client.CommonAPIClient) (*Swar
 					Image: s.Spec.TaskTemplate.ContainerSpec.Image,
 				}
 
-				// Replicas count
-				if s.Spec.Mode.Replicated != nil && s.Spec.Mode.Replicated.Replicas != nil {
-					ss.Replicas = *s.Spec.Mode.Replicated.Replicas
+				if s.Spec.Mode.Replicated != nil {
+					ss.Mode = "replicated"
+					if s.Spec.Mode.Replicated.Replicas != nil {
+						ss.Replicas = *s.Spec.Mode.Replicated.Replicas
+					}
+				} else if s.Spec.Mode.Global != nil {
+					ss.Mode = "global"
+					ss.Replicas = uint64(len(nodes))
 				}
 
 				// Use pre-collected counts

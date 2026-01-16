@@ -153,6 +153,22 @@ func TestCollectSwarmMetrics(t *testing.T) {
 							},
 						},
 					},
+					{
+						ID: "global-svc-id",
+						Spec: swarm.ServiceSpec{
+							Annotations: swarm.Annotations{
+								Name: "global-service",
+							},
+							Mode: swarm.ServiceMode{
+								Global: &swarm.GlobalService{},
+							},
+							TaskTemplate: swarm.TaskSpec{
+								ContainerSpec: &swarm.ContainerSpec{
+									Image: "global-image:latest",
+								},
+							},
+						},
+					},
 				}, nil
 			},
 			taskListFunc: func(ctx context.Context, options types.TaskListOptions) ([]swarm.Task, error) {
@@ -186,11 +202,17 @@ func TestCollectSwarmMetrics(t *testing.T) {
 		if len(sm.Nodes) != 1 {
 			t.Errorf("Expected 1 node, got %v", len(sm.Nodes))
 		}
-		if len(sm.Services) != 1 {
-			t.Errorf("Expected 1 service, got %v", len(sm.Services))
+		if len(sm.Services) != 2 {
+			t.Errorf("Expected 2 services, got %v", len(sm.Services))
 		}
-		if sm.Services[0].RunningTasks != 2 {
-			t.Errorf("Expected 2 running tasks, got %v", sm.Services[0].RunningTasks)
+		if sm.Services[0].Mode != "replicated" {
+			t.Errorf("Expected mode replicated, got %v", sm.Services[0].Mode)
+		}
+		if sm.Services[1].Mode != "global" {
+			t.Errorf("Expected mode global, got %v", sm.Services[1].Mode)
+		}
+		if sm.Services[1].Replicas != 1 {
+			t.Errorf("Expected 1 replica for global service (1 node), got %v", sm.Services[1].Replicas)
 		}
 	})
 }
