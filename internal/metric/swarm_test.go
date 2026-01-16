@@ -157,9 +157,18 @@ func TestCollectSwarmMetrics(t *testing.T) {
 			},
 			taskListFunc: func(ctx context.Context, options types.TaskListOptions) ([]swarm.Task, error) {
 				return []swarm.Task{
-					{Status: swarm.TaskStatus{State: swarm.TaskStateRunning}},
-					{Status: swarm.TaskStatus{State: swarm.TaskStateRunning}},
-					{Status: swarm.TaskStatus{State: swarm.TaskStateShutdown}},
+					{
+						ServiceID: "svc-id",
+						Status:    swarm.TaskStatus{State: swarm.TaskStateRunning},
+					},
+					{
+						ServiceID: "svc-id",
+						Status:    swarm.TaskStatus{State: swarm.TaskStateRunning},
+					},
+					{
+						ServiceID: "svc-id",
+						Status:    swarm.TaskStatus{State: swarm.TaskStateShutdown},
+					},
 				}, nil
 			},
 		}

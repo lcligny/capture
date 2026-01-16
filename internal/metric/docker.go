@@ -7,7 +7,6 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/client"
 )
@@ -106,7 +105,7 @@ const (
 func GetDockerMetrics(all bool) (Metric, []CustomErr) {
 	var containerErrors []CustomErr
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	cli, err := initializeDockerClient()
@@ -142,13 +141,26 @@ func GetDockerMetrics(all bool) (Metric, []CustomErr) {
 		})
 	}
 
-	for _, container := range containers {
-		m, customErr := processContainer(ctx, cli, container)
-		if customErr.Error != "" {
-			containerErrors = append(containerErrors, customErr)
+	type result struct {
+		m   ContainerMetrics
+		err CustomErr
+	}
+	resChan := make(chan result, len(containers))
+
+	for _, c := range containers {
+		go func(c container.Summary) {
+			m, customErr := processContainer(ctx, cli, c)
+			resChan <- result{m, customErr}
+		}(c)
+	}
+
+	for i := 0; i < len(containers); i++ {
+		res := <-resChan
+		if res.err.Error != "" {
+			containerErrors = append(containerErrors, res.err)
 			continue
 		}
-		payload.Containers = append(payload.Containers, m)
+		payload.Containers = append(payload.Containers, res.m)
 	}
 
 	if len(containerErrors) > 0 {
@@ -204,6 +216,17 @@ func collectSwarmMetrics(ctx context.Context, cli client.CommonAPIClient) (*Swar
 		// Collect services
 		services, err := cli.ServiceList(ctx, types.ServiceListOptions{})
 		if err == nil {
+			// Optimization: Collect all running tasks once to avoid N calls to TaskList
+			allTasks, taskErr := cli.TaskList(ctx, types.TaskListOptions{})
+			taskCounts := make(map[string]uint64)
+			if taskErr == nil {
+				for _, t := range allTasks {
+					if t.Status.State == swarm.TaskStateRunning {
+						taskCounts[t.ServiceID]++
+					}
+				}
+			}
+
 			sm.Services = make([]SwarmService, 0, len(services))
 			for _, s := range services {
 				ss := SwarmService{
@@ -217,17 +240,9 @@ func collectSwarmMetrics(ctx context.Context, cli client.CommonAPIClient) (*Swar
 					ss.Replicas = *s.Spec.Mode.Replicated.Replicas
 				}
 
-				// Count running tasks
-				tasks, err := cli.TaskList(ctx, types.TaskListOptions{
-					Filters: filters.NewArgs(filters.KeyValuePair{Key: "service", Value: s.ID}),
-				})
-				if err == nil {
-					for _, t := range tasks {
-						if t.Status.State == swarm.TaskStateRunning {
-							ss.RunningTasks++
-						}
-					}
-				}
+				// Use pre-collected counts
+				ss.RunningTasks = taskCounts[s.ID]
+
 				sm.Services = append(sm.Services, ss)
 			}
 		}
