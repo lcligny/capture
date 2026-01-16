@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/client"
 )
 
@@ -20,7 +23,53 @@ type ContainerMetrics struct {
 	StartedAt     int64                  `json:"started_at"`  // Unix timestamp
 	FinishedAt    int64                  `json:"finished_at"` // Unix timestamp
 	Stats         *ContainerStats        `json:"stats"`
+	Swarm         *ContainerSwarmInfo    `json:"swarm,omitempty"`
 }
+
+type ContainerSwarmInfo struct {
+	NodeID    string `json:"node_id"`
+	ServiceID string `json:"service_id"`
+	TaskID    string `json:"task_id"`
+}
+
+type SwarmMetrics struct {
+	IsSwarm  bool           `json:"is_swarm"`
+	NodeID   string         `json:"node_id,omitempty"`
+	NodeName string         `json:"node_name,omitempty"`
+	Role     string         `json:"role,omitempty"`   // "worker", "manager"
+	Status   string         `json:"status,omitempty"` // "unknown", "ready", "down", "disconnected"
+	Nodes    []SwarmNode    `json:"nodes,omitempty"`
+	Services []SwarmService `json:"services,omitempty"`
+}
+
+type SwarmNode struct {
+	ID            string              `json:"id"`
+	Hostname      string              `json:"hostname"`
+	Status        string              `json:"status"`
+	Availability  string              `json:"availability"`
+	Role          string              `json:"role"`
+	ManagerStatus *SwarmManagerStatus `json:"manager_status,omitempty"`
+}
+
+type SwarmManagerStatus struct {
+	Leader       bool   `json:"leader"`
+	Reachability string `json:"reachability"`
+}
+
+type SwarmService struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Image        string `json:"image"`
+	Replicas     uint64 `json:"replicas"`
+	RunningTasks uint64 `json:"running_tasks"`
+}
+
+type DockerPayload struct {
+	Containers []ContainerMetrics `json:"containers"`
+	Swarm      *SwarmMetrics      `json:"swarm,omitempty"`
+}
+
+func (d DockerPayload) isMetric() {}
 
 type ContainerStats struct {
 	CPUPercent    float64 `json:"cpu_percent"`
@@ -54,11 +103,10 @@ const (
 	SourceStateBasedHealthCheck ContainerHealthSource = "state_based_health_check"
 )
 
-func GetDockerMetrics(all bool) (MetricsSlice, []CustomErr) {
-	var metrics = make(MetricsSlice, 0)
+func GetDockerMetrics(all bool) (Metric, []CustomErr) {
 	var containerErrors []CustomErr
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	cli, err := initializeDockerClient()
@@ -71,6 +119,21 @@ func GetDockerMetrics(all bool) (MetricsSlice, []CustomErr) {
 	}
 	defer cli.Close()
 
+	payload := DockerPayload{
+		Containers: make([]ContainerMetrics, 0),
+	}
+
+	// Collect Swarm metrics
+	swarmMetrics, err := collectSwarmMetrics(ctx, cli)
+	if err != nil {
+		containerErrors = append(containerErrors, CustomErr{
+			Metric: []string{"docker.swarm"},
+			Error:  err.Error(),
+		})
+	} else {
+		payload.Swarm = swarmMetrics
+	}
+
 	containers, err := listContainers(ctx, cli, all)
 	if err != nil {
 		return nil, append(containerErrors, CustomErr{
@@ -80,19 +143,99 @@ func GetDockerMetrics(all bool) (MetricsSlice, []CustomErr) {
 	}
 
 	for _, container := range containers {
-		metric, customErr := processContainer(ctx, cli, container)
+		m, customErr := processContainer(ctx, cli, container)
 		if customErr.Error != "" {
 			containerErrors = append(containerErrors, customErr)
 			continue
 		}
-		metrics = append(metrics, metric)
+		payload.Containers = append(payload.Containers, m)
 	}
 
 	if len(containerErrors) > 0 {
-		return metrics, containerErrors
+		return payload, containerErrors
 	}
 
-	return metrics, nil
+	return payload, nil
+}
+
+// collectSwarmMetrics gathers Swarm-specific information if the node is part of a Swarm.
+func collectSwarmMetrics(ctx context.Context, cli client.CommonAPIClient) (*SwarmMetrics, error) {
+	info, err := cli.Info(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if info.Swarm.LocalNodeState != swarm.LocalNodeStateActive {
+		return &SwarmMetrics{IsSwarm: false}, nil
+	}
+
+	sm := &SwarmMetrics{
+		IsSwarm:  true,
+		NodeID:   info.Swarm.NodeID,
+		NodeName: info.Name,
+		Status:   string(info.Swarm.LocalNodeState),
+	}
+
+	if info.Swarm.ControlAvailable {
+		sm.Role = "manager"
+
+		// Collect nodes
+		nodes, err := cli.NodeList(ctx, types.NodeListOptions{})
+		if err == nil {
+			sm.Nodes = make([]SwarmNode, 0, len(nodes))
+			for _, n := range nodes {
+				sn := SwarmNode{
+					ID:           n.ID,
+					Hostname:     n.Description.Hostname,
+					Status:       string(n.Status.State),
+					Availability: string(n.Spec.Availability),
+					Role:         string(n.Spec.Role),
+				}
+				if n.ManagerStatus != nil {
+					sn.ManagerStatus = &SwarmManagerStatus{
+						Leader:       n.ManagerStatus.Leader,
+						Reachability: string(n.ManagerStatus.Reachability),
+					}
+				}
+				sm.Nodes = append(sm.Nodes, sn)
+			}
+		}
+
+		// Collect services
+		services, err := cli.ServiceList(ctx, types.ServiceListOptions{})
+		if err == nil {
+			sm.Services = make([]SwarmService, 0, len(services))
+			for _, s := range services {
+				ss := SwarmService{
+					ID:    s.ID,
+					Name:  s.Spec.Name,
+					Image: s.Spec.TaskTemplate.ContainerSpec.Image,
+				}
+
+				// Replicas count
+				if s.Spec.Mode.Replicated != nil && s.Spec.Mode.Replicated.Replicas != nil {
+					ss.Replicas = *s.Spec.Mode.Replicated.Replicas
+				}
+
+				// Count running tasks
+				tasks, err := cli.TaskList(ctx, types.TaskListOptions{
+					Filters: filters.NewArgs(filters.KeyValuePair{Key: "service", Value: s.ID}),
+				})
+				if err == nil {
+					for _, t := range tasks {
+						if t.Status.State == swarm.TaskStateRunning {
+							ss.RunningTasks++
+						}
+					}
+				}
+				sm.Services = append(sm.Services, ss)
+			}
+		}
+	} else {
+		sm.Role = "worker"
+	}
+
+	return sm, nil
 }
 
 // initializeDockerClient creates a new Docker client with environment configuration.
@@ -106,7 +249,7 @@ func initializeDockerClient() (*client.Client, error) {
 }
 
 // listContainers retrieves the list of containers from Docker.
-func listContainers(ctx context.Context, cli *client.Client, all bool) ([]container.Summary, error) {
+func listContainers(ctx context.Context, cli client.ContainerAPIClient, all bool) ([]container.Summary, error) {
 	// List all containers
 	containers, err := cli.ContainerList(ctx, container.ListOptions{
 		All: all,
@@ -118,7 +261,7 @@ func listContainers(ctx context.Context, cli *client.Client, all bool) ([]contai
 }
 
 // processContainer processes a single container and returns its metrics.
-func processContainer(ctx context.Context, cli *client.Client, container container.Summary) (ContainerMetrics, CustomErr) {
+func processContainer(ctx context.Context, cli client.ContainerAPIClient, container container.Summary) (ContainerMetrics, CustomErr) {
 	containerInspectResponse, err := inspectContainer(ctx, cli, container.ID)
 	if err != nil {
 		return ContainerMetrics{}, CustomErr{
@@ -139,6 +282,20 @@ func processContainer(ctx context.Context, cli *client.Client, container contain
 	rx, tx := calculateNetworkMetrics(containerStats)
 	blockRead, blockWrite := calculateBlockIOMetrics(containerStats)
 	pids := containerStats.PidsStats.Current
+
+	var swarmInfo *ContainerSwarmInfo
+	if containerInspectResponse.Config != nil && containerInspectResponse.Config.Labels != nil {
+		nodeID := containerInspectResponse.Config.Labels["com.docker.swarm.node.id"]
+		serviceID := containerInspectResponse.Config.Labels["com.docker.swarm.service.id"]
+		taskID := containerInspectResponse.Config.Labels["com.docker.swarm.task.id"]
+		if nodeID != "" || serviceID != "" || taskID != "" {
+			swarmInfo = &ContainerSwarmInfo{
+				NodeID:    nodeID,
+				ServiceID: serviceID,
+				TaskID:    taskID,
+			}
+		}
+	}
 
 	return ContainerMetrics{
 		ContainerID:   container.ID,
@@ -161,11 +318,12 @@ func processContainer(ctx context.Context, cli *client.Client, container contain
 			BlockWrite:    blockWrite,
 			PIDs:          pids,
 		},
+		Swarm: swarmInfo,
 	}, CustomErr{}
 }
 
 // inspectContainer inspects a container and returns its detailed information.
-func inspectContainer(ctx context.Context, cli *client.Client, containerID string) (container.InspectResponse, error) {
+func inspectContainer(ctx context.Context, cli client.ContainerAPIClient, containerID string) (container.InspectResponse, error) {
 	// Inspect each container
 	containerInspectResponse, err := cli.ContainerInspect(ctx, containerID)
 	if err != nil {
@@ -228,7 +386,7 @@ type dockerStatsResponse struct {
 }
 
 // getContainerStats retrieves and decodes container statistics.
-func getContainerStats(ctx context.Context, cli *client.Client, containerID string) (dockerStatsResponse, CustomErr) {
+func getContainerStats(ctx context.Context, cli client.ContainerAPIClient, containerID string) (dockerStatsResponse, CustomErr) {
 	// Get container stats
 	stats, err := cli.ContainerStats(ctx, containerID, false)
 	if err != nil {
